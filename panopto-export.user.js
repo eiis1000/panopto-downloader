@@ -2,7 +2,7 @@
 // @name         Panopto Folder Export (for panopto-fetch)
 // @namespace    https://github.com/local/panopto-fetch
 // @description  Pick a view on a Panopto video/folder and copy a manifest string for the panopto-fetch CLI.
-// @version      1.3.0
+// @version      1.4.0
 // @match        https://*.panopto.com/Panopto/Pages/Sessions/List.aspx*
 // @match        https://*.panopto.eu/Panopto/Pages/Sessions/List.aspx*
 // @match        https://*.hosted.panopto.com/Panopto/Pages/Sessions/List.aspx*
@@ -137,6 +137,15 @@
     if (view.tag) { const m = streams.find(s => s.Tag === view.tag); if (m) return m.StreamUrl; }
     const p = delivery.PodcastStreams && delivery.PodcastStreams[0]; // last-resort fallback
     return p && p.StreamUrl;
+  }
+
+  // The combined podcast is Panopto's most reliable audio-bearing rendition.
+  // Fall back to the primary (first) source stream when no podcast exists.
+  function pickAudioUrl(delivery) {
+    const podcast = delivery.PodcastStreams && delivery.PodcastStreams[0];
+    if (podcast && podcast.StreamUrl) return podcast.StreamUrl;
+    const primary = delivery.Streams && delivery.Streams[0];
+    return primary && primary.StreamUrl;
   }
 
   // ------------------------------------------------------- folder enumeration
@@ -352,13 +361,17 @@
     const items = await mapLimit(videos, CONCURRENCY, async (v) => {
       const d = await deliveryInfo(v.id);
       const url = pickUrl(d, view);
+      const audioUrl = pickAudioUrl(d);
       done++; say(`Resolving "${view.name}"… ${done}/${videos.length}`);
       if (!url) throw new Error("no url");
-      return { title: v.title || v.id, view: view.name.replace(/\s*\(.*\)$/, "").trim() || "video", url };
+      return { title: v.title || v.id,
+        view: view.name.replace(/\s*\(.*\)$/, "").trim() || "video",
+        url, audioUrl };
     });
 
     const ok = items.filter(it => it && !it.__err)
-      .map((it, i) => ({ index: i + 1, title: it.title, view: it.view, url: it.url }));
+      .map((it, i) => ({ index: i + 1, title: it.title, view: it.view,
+        url: it.url, audioUrl: it.audioUrl }));
     const failed = videos.length - ok.length;
 
     const manifest = { origin: ORIGIN, folderId: folderId(), folderTitle:

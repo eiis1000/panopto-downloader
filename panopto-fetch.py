@@ -50,6 +50,10 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 # Allow pointing at a specific ffmpeg (e.g. a system build with NVENC) via $FFMPEG.
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
+FFPROBE = os.environ.get(
+    "FFPROBE",
+    str(Path(FFMPEG).with_name("ffprobe")) if "/" in FFMPEG else "ffprobe",
+)
 
 
 def video_args(codec: str, crf: int | None, preset: str | None,
@@ -102,6 +106,7 @@ class Item:
     title: str
     view: str
     url: str
+    audio_url: str | None = None
 
 
 def load_manifest(raw: str) -> tuple[dict, list[Item]]:
@@ -131,6 +136,7 @@ def load_manifest(raw: str) -> tuple[dict, list[Item]]:
             title=(it.get("title") or f"video-{i}").strip(),
             view=(it.get("view") or "video").strip(),
             url=url,
+            audio_url=it.get("audioUrl") or it.get("audio_url"),
         ))
     if not items:
         sys.exit("error: manifest items have no resolvable stream URLs")
@@ -183,24 +189,58 @@ def log(msg: str) -> None:
         print(msg, flush=True)
 
 
+def input_options(url: str, origin: str) -> list[str]:
+    """FFmpeg/ffprobe options that apply to HTTP inputs only."""
+    if not re.match(r"https?://", url, re.IGNORECASE):
+        return []
+    options = ["-user_agent", UA]
+    if origin:
+        options += ["-headers", f"Referer: {origin}/\r\n"]
+    return options
+
+
+def has_audio(url: str, origin: str) -> bool:
+    """Return whether ffprobe can see an audio stream in a remote input."""
+    cmd = [FFPROBE, "-v", "error", *input_options(url, origin)]
+    cmd += ["-select_streams", "a", "-show_entries", "stream=index",
+            "-of", "csv=p=0", url]
+    probe = subprocess.run(cmd, capture_output=True, text=True)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
 def encode_one(item: Item, out: Path, origin: str, vargs: list[str],
                aargs: list[str], filters: list[str], ext: str,
-               overwrite: bool, dry_run: bool) -> tuple[Item, str]:
+               overwrite: bool, dry_run: bool,
+               audio_only: bool = False) -> tuple[Item, str]:
     if out.exists() and not overwrite:
         return item, "skip"
 
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
-           "-user_agent", UA]
-    if origin:
-        cmd += ["-headers", f"Referer: {origin}/\r\n"]
-    cmd += ["-i", item.url]
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-stats"]
+    media_url = item.url
+    fallback_audio = None
+    if audio_only:
+        # Old manifests have no audioUrl. Their selected URL remains the source.
+        if item.audio_url and item.audio_url != item.url:
+            media_url = item.audio_url
+    elif item.audio_url and item.audio_url != item.url and not has_audio(item.url, origin):
+        fallback_audio = item.audio_url
+
+    cmd += [*input_options(media_url, origin), "-i", media_url]
+    if fallback_audio:
+        cmd += [*input_options(fallback_audio, origin), "-i", fallback_audio]
 
     # Panopto HLS playlists can advertise pathological nominal frame rates.
     # SVT-AV1 rejects anything above 240 fps, so normalize CFR before encode.
-    cmd += ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn"]
-    if filters:
-        cmd += ["-vf", ",".join(filters)]
-    cmd += vargs + aargs
+    if audio_only:
+        cmd += ["-map", "0:a:0", "-vn", "-sn", "-dn", *aargs]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0" if fallback_audio else "0:a?",
+                "-sn", "-dn"]
+        if fallback_audio:
+            cmd += ["-shortest"]
+        if filters:
+            cmd += ["-vf", ",".join(filters)]
+        cmd += vargs + aargs
     if ext == "mp4":
         cmd += ["-movflags", "+faststart"]
     # Keep the real extension last so ffmpeg can infer the muxer (foo.part.mkv).
@@ -266,6 +306,8 @@ def main() -> None:
                    help="don't prefix filenames with NN -")
     p.add_argument("--overwrite", action="store_true", help="re-encode even if output exists")
     p.add_argument("--dry-run", action="store_true", help="print ffmpeg commands, don't run")
+    p.add_argument("--audio-only", action="store_true",
+                   help="download/re-encode only audio as Opus (or AAC fallback)")
     args = p.parse_args()
 
     if not (shutil.which(FFMPEG) or Path(FFMPEG).exists()):
@@ -283,12 +325,15 @@ def main() -> None:
     folder = meta.get("folderTitle") or meta.get("folderId") or ""
 
     have = ffmpeg_encoders()
-    vargs, ext = video_args(args.codec, args.crf, args.preset, args.ten_bit, have)
     aargs = audio_args(have)
+    if args.audio_only:
+        vargs, ext = [], "opus" if "libopus" in have else "m4a"
+    else:
+        vargs, ext = video_args(args.codec, args.crf, args.preset, args.ten_bit, have)
     filters = []
-    if args.fps:
+    if args.fps and not args.audio_only:
         filters.append(f"fps={args.fps:g}")
-    if args.denoise:
+    if args.denoise and not args.audio_only:
         filters.append("hqdn3d=1.5:1.5:6:6")
 
     outdir = Path(args.outdir).expanduser()
@@ -298,7 +343,8 @@ def main() -> None:
     log(f"Folder : {folder}")
     if args.skip:
         log(f"Skipped: {args.skip} of {original_count} manifest videos")
-    log(f"Videos : {len(items)}   codec={args.codec} ({ext})   jobs={jobs}"
+    mode = f"audio-only ({ext})" if args.audio_only else f"codec={args.codec} ({ext})"
+    log(f"Videos : {len(items)}   {mode}   jobs={jobs}"
         + (f"   filters={','.join(filters)}" if filters else "   filters=off"))
     log(f"Output : {outdir}\n")
 
@@ -308,7 +354,8 @@ def main() -> None:
         for it in items:
             out = output_path(outdir, it, len(items), ext, args.number)
             futs.append(ex.submit(encode_one, it, out, origin, vargs, aargs,
-                                  filters, ext, args.overwrite, args.dry_run))
+                                  filters, ext, args.overwrite, args.dry_run,
+                                  args.audio_only))
         for f in concurrent.futures.as_completed(futs):
             results.append(f.result())
 

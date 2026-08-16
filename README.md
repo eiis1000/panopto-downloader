@@ -39,11 +39,16 @@ nix run . -- '<MANIFEST>' -o ~/panopto
 
    ```sh
    panopto-fetch '<paste the manifest>' -o ~/panopto
+   panopto-fetch '<paste the manifest>' --audio-only -o ~/panopto-audio
    # or:  pbpaste | panopto-fetch -o ~/panopto
    # or:  panopto-fetch -f manifest.txt -o ~/panopto
    ```
 
 Files land as `01 - <Original Title> [<View>].mkv`.
+
+The exporter also records the combined/main audio rendition. If the chosen camera
+or object view has no audio stream, the CLI detects that and muxes in this audio
+automatically. `--audio-only` writes just the audio as Opus (AAC/M4A fallback).
 
 > The manifest carries signed CDN URLs that expire after a few hours. Run the CLI
 > soon after exporting; on auth/403 errors, just click the button again.
@@ -65,6 +70,7 @@ is Opus 96k. Output container is `.mkv`.
 | `--no-number` | off | drop the `NN - ` filename prefix |
 | `--overwrite` | off | re-encode even if output exists (otherwise skips = resume) |
 | `--dry-run` | off | print the ffmpeg commands without running |
+| `--audio-only` | off | download/re-encode only the audio stream |
 
 `nvenc` needs a system ffmpeg built with NVENC + a working NVIDIA driver. The flake's
 ffmpeg doesn't include it; point at your system build:
